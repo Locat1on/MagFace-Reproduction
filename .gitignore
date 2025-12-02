@@ -1,0 +1,6 @@
+photo/
+output/
+scripts/
+*.pyc
+pretrain/
+database/

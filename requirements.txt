@@ -1,0 +1,31 @@
+
+# 人脸检测与处理
+facenet-pytorch
+opencv-python
+Pillow
+scikit-image
+
+# 数据处理与科学计算
+numpy
+scipy
+scikit-learn
+pandas
+
+# 训练相关
+tqdm
+tensorboard
+mxnet
+
+# 特征检索
+faiss-cpu          # 或 faiss-gpu (如果有 GPU)
+
+# Web 应用
+streamlit
+fastapi
+uvicorn
+
+# 工具
+PyYAML
+easydict
+matplotlib
+seaborn
