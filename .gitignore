@@ -6,3 +6,6 @@ pretrain/
 database/
 __pycache__/
 */__pycache__/
+debug_*
+*.log
+inspect_*

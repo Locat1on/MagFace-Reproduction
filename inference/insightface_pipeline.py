@@ -1,6 +1,5 @@
 """
-InsightFace 人脸识别 Pipeline
-使用 InsightFace 库实现检测、对齐、特征提取、质量评估
+MagFace 人脸识别 Pipeline
 """
 
 import os
@@ -8,6 +7,10 @@ import numpy as np
 import cv2
 from typing import Optional, List, Dict, Tuple, Union
 import pickle
+
+# 设置 InsightFace 模型存储路径（避免下载到系统盘）
+INSIGHTFACE_MODEL_ROOT = os.environ.get('INSIGHTFACE_HOME', r'D:\models\insightface')
+os.environ['INSIGHTFACE_HOME'] = INSIGHTFACE_MODEL_ROOT
 
 
 class InsightFacePipeline:
@@ -24,7 +27,7 @@ class InsightFacePipeline:
 
     def __init__(
         self,
-        model_name: str = 'buffalo_l',
+        model_name: str = 'antelopev2',
         device: str = 'cuda',
         det_size: Tuple[int, int] = (640, 640),
         quality_threshold: float = 0.5,
@@ -45,23 +48,22 @@ class InsightFacePipeline:
         self.det_size = det_size
 
         # 初始化 InsightFace
-        print("初始化 InsightFace...")
+        print(f"初始化 InsightFace... (模型目录: {INSIGHTFACE_MODEL_ROOT})")
         try:
             from insightface.app import FaceAnalysis
             providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if device == 'cuda' else ['CPUExecutionProvider']
-            self.app = FaceAnalysis(name=model_name, providers=providers)
+            self.app = FaceAnalysis(
+                name=model_name,
+                root=INSIGHTFACE_MODEL_ROOT,  # 指定模型存储路径
+                providers=providers
+            )
             self.app.prepare(ctx_id=0 if device == 'cuda' else -1, det_size=det_size)
             print(f"InsightFace 初始化成功: {model_name}")
         except ImportError:
             raise ImportError("请安装 insightface: pip install insightface onnxruntime-gpu")
 
         # 人脸底库
-        self.database = {
-            'names': [],           # 姓名列表
-            'features': None,      # 特征矩阵 (N, 512)
-            'qualities': [],       # 质量分数列表
-            'images': []           # 对齐后的人脸图像 (可选)
-        }
+        self._reset_database()
 
     def detect_faces(self, image: np.ndarray) -> List[Dict]:
         """
@@ -86,18 +88,64 @@ class InsightFacePipeline:
             })
         return results
 
-    def extract_features(self, image: np.ndarray) -> Tuple[Optional[np.ndarray], float, Optional[np.ndarray]]:
+    def enhance_image(self, image: np.ndarray) -> np.ndarray:
+        """
+        图像预处理增强，提升跨光照/跨条件下的识别准确率
+
+        包含:
+        1. 自适应直方图均衡化 (CLAHE) - 改善光照不均
+        2. 去噪 - 减少噪声干扰
+        3. 锐化 - 增强边缘细节
+
+        Args:
+            image: BGR 格式的图像
+
+        Returns:
+            增强后的图像 (BGR)
+        """
+        if image is None:
+            return image
+
+        # 1. 转换到 LAB 色彩空间，只对亮度通道处理
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+
+        # 2. 自适应直方图均衡化 (CLAHE) - 改善光照
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        l = clahe.apply(l)
+
+        # 3. 合并通道
+        lab = cv2.merge([l, a, b])
+        enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+        # 4. 轻微去噪 (保留细节)
+        enhanced = cv2.bilateralFilter(enhanced, d=5, sigmaColor=50, sigmaSpace=50)
+
+        # 5. 轻微锐化 (可选，增强边缘)
+        # kernel = np.array([[-0.5, -0.5, -0.5],
+        #                    [-0.5,  5.0, -0.5],
+        #                    [-0.5, -0.5, -0.5]])
+        # enhanced = cv2.filter2D(enhanced, -1, kernel)
+
+        return enhanced
+
+    def extract_features(self, image: np.ndarray, enhance: bool = True) -> Tuple[Optional[np.ndarray], float, Optional[np.ndarray]]:
         """
         从图像中检测人脸并提取特征
 
         Args:
             image: BGR 格式的图像
+            enhance: 是否启用图像预处理增强（默认启用）
 
         Returns:
             embedding: 512维特征向量，失败返回 None
             quality: 质量分数 (0~1)
             aligned_face: 对齐后的人脸图像 (112x112)，失败返回 None
         """
+        # 图像预处理增强
+        if enhance:
+            image = self.enhance_image(image)
+
         faces = self.app.get(image)
         if len(faces) == 0:
             return None, 0.0, None
@@ -121,20 +169,33 @@ class InsightFacePipeline:
 
     def _align_face(self, image: np.ndarray, landmarks: np.ndarray, output_size: Tuple[int, int] = (112, 112)) -> np.ndarray:
         """
-        根据关键点对齐人脸 (简化版)
+        根据关键点对齐人脸（优化版）
+
+        使用纯 OpenCV 实现仿射变换，支持多种输出尺寸。
+        采用 ArcFace 标准 112x112 模板，自动缩放到目标尺寸。
 
         Args:
             image: 原始图像 (BGR)
-            landmarks: 5个关键点坐标 (5, 2)
-            output_size: 输出图像大小
+            landmarks: 5个关键点坐标 (5, 2) - 左眼、右眼、鼻尖、左嘴角、右嘴角
+            output_size: 输出图像大小，默认 (112, 112)
 
         Returns:
             对齐后的人脸图像
         """
-        from skimage import transform as trans
+        # 输入验证
+        if landmarks is None or landmarks.shape != (5, 2):
+            # 如果关键点无效，返回中心裁剪
+            h, w = image.shape[:2]
+            center = (w // 2, h // 2)
+            size = min(h, w)
+            x1 = max(0, center[0] - size // 2)
+            y1 = max(0, center[1] - size // 2)
+            cropped = image[y1:y1+size, x1:x1+size]
+            return cv2.resize(cropped, output_size)
 
-        # ArcFace 标准对齐模板
-        dst = np.array([
+        # ArcFace 标准对齐模板 (基于 112x112)
+        # 关键点顺序: 左眼、右眼、鼻尖、左嘴角、右嘴角
+        arcface_dst = np.array([
             [38.2946, 51.6963],
             [73.5318, 51.5014],
             [56.0252, 71.7366],
@@ -142,10 +203,38 @@ class InsightFacePipeline:
             [70.7299, 92.2041]
         ], dtype=np.float32)
 
-        tform = trans.SimilarityTransform()
-        tform.estimate(landmarks, dst)
-        M = tform.params[0:2, :]
-        aligned = cv2.warpAffine(image, M, output_size, borderValue=0)
+        # 如果输出尺寸不是 112x112，缩放模板
+        if output_size != (112, 112):
+            scale_x = output_size[0] / 112.0
+            scale_y = output_size[1] / 112.0
+            arcface_dst = arcface_dst * np.array([scale_x, scale_y])
+
+        # 确保 landmarks 是 float32
+        src_pts = landmarks.astype(np.float32)
+        dst_pts = arcface_dst.astype(np.float32)
+
+        # 使用 OpenCV 估计相似变换矩阵（更稳定）
+        # estimateAffinePartial2D 估计带旋转、缩放、平移的变换（4自由度）
+        M, inliers = cv2.estimateAffinePartial2D(
+            src_pts,
+            dst_pts,
+            method=cv2.LMEDS,
+            ransacReprojThreshold=5.0
+        )
+
+        # 如果估计失败，使用简单的 3 点仿射变换
+        if M is None:
+            M = cv2.getAffineTransform(src_pts[:3], dst_pts[:3])
+
+        # 应用仿射变换
+        aligned = cv2.warpAffine(
+            image,
+            M,
+            output_size,
+            borderMode=cv2.BORDER_REPLICATE,  # 边界复制，比纯黑更自然
+            flags=cv2.INTER_LINEAR
+        )
+
         return aligned
 
     def assess_quality(self, det_score: float) -> Dict:
@@ -290,6 +379,8 @@ class InsightFacePipeline:
         results = []
         for idx in sorted_indices:
             sim = float(similarities[idx])
+            # 修正：将负数相似度归零，避免用户困惑
+            sim = max(0.0, sim)
             results.append({
                 'name': self.database['names'][idx],
                 'similarity': sim,
@@ -345,6 +436,8 @@ class InsightFacePipeline:
         emb1 = emb1 / np.linalg.norm(emb1)
         emb2 = emb2 / np.linalg.norm(emb2)
         similarity = float(np.dot(emb1, emb2))
+        # 修正：将负数相似度归零
+        similarity = max(0.0, similarity)
 
         return {
             'success': True,
@@ -386,6 +479,40 @@ class InsightFacePipeline:
         with open(path, 'rb') as f:
             self.database = pickle.load(f)
         print(f"底库已加载，共 {len(self.database['names'])} 人")
+
+    def _reset_database(self):
+        self.database = {
+            'names': [],
+            'features': None,
+            'qualities': [],
+            'images': []
+        }
+
+    def clear_database(self, path: Optional[str] = None, remove_file: bool = True) -> Dict:
+        """清空底库并可选删除持久化文件"""
+        previous_count = len(self.database.get('names', []))
+        self._reset_database()
+
+        removed_file = False
+        if path and remove_file:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+                    removed_file = True
+            except OSError as exc:
+                return {
+                    'success': False,
+                    'message': f"删除文件失败: {exc}",
+                    'removed_file': False,
+                    'previous_count': previous_count
+                }
+
+        return {
+            'success': True,
+            'message': f"已清空底库，共删除 {previous_count} 条记录",
+            'removed_file': removed_file,
+            'previous_count': previous_count
+        }
 
     def detect_and_align(self, image: Union[str, np.ndarray]) -> Optional[np.ndarray]:
         """

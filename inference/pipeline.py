@@ -57,6 +57,7 @@ class FaceRecognitionPipeline:
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.quality_threshold = quality_threshold
         self.similarity_threshold = similarity_threshold
+        self.debug = os.environ.get('MAGFACE_DEBUG', '1') != '0'
 
         # 初始化人脸检测器
         print("初始化人脸检测器...")
@@ -75,12 +76,7 @@ class FaceRecognitionPipeline:
             print("警告: 未加载预训练权重，模型使用随机初始化")
 
         # 人脸底库
-        self.database = {
-            'names': [],           # 姓名列表
-            'features': None,      # 特征矩阵 (N, embedding_size)
-            'magnitudes': [],      # 幅度列表
-            'images': []           # 原始图像 (可选)
-        }
+        self._reset_database()
 
     def _load_model(self, model_path: str):
         """加载模型权重（兼容官方预训练模型格式）"""
@@ -126,17 +122,32 @@ class FaceRecognitionPipeline:
 
             backbone_state_dict[new_key] = v
 
+        # DEBUG: 检查 fc.weight 是否存在于 backbone_state_dict
+        if 'fc.weight' in backbone_state_dict:
+            print(f"DEBUG: fc.weight found in backbone_state_dict with shape {backbone_state_dict['fc.weight'].shape}")
+            print(f"DEBUG: fc.weight mean: {backbone_state_dict['fc.weight'].float().mean():.6f}")
+        else:
+            print("DEBUG: fc.weight NOT found in backbone_state_dict")
+
         print(f"提取到 {len(backbone_state_dict)} 个 backbone 参数")
 
         # 加载权重，使用 strict=False 允许部分加载
         missing_keys, unexpected_keys = self.model.load_state_dict(backbone_state_dict, strict=False)
 
         if missing_keys:
-            print(f"缺失的参数 ({len(missing_keys)}): {missing_keys[:5]}...")
+            print(f"警告: 缺失的参数 ({len(missing_keys)}): {missing_keys[:10]}...")
         if unexpected_keys:
-            print(f"多余的参数 ({len(unexpected_keys)}): {unexpected_keys[:5]}...")
+            print(f"警告: 多余的参数 ({len(unexpected_keys)}): {unexpected_keys[:10]}...")
 
-        print(f"模型加载成功")
+        if self.debug:
+            print(f"DEBUG: load_state summary | missing={len(missing_keys)} | unexpected={len(unexpected_keys)}")
+
+        if len(missing_keys) > 20:
+             print("严重警告: 大量参数缺失，模型可能未正确加载！")
+
+        self._debug_model_stats()
+
+        print(f"模型加载完成")
 
     def detect_and_align(self, image: Union[str, np.ndarray]) -> Optional[np.ndarray]:
         """
@@ -161,14 +172,28 @@ class FaceRecognitionPipeline:
             features: 归一化特征向量 (512,)
             magnitude: 特征幅度 (质量分数)
         """
+        # BGR -> RGB (MagFace 模型通常使用 RGB 训练)
+        face_image = cv2.cvtColor(face_image, cv2.COLOR_BGR2RGB)
+
         # 预处理
-        face = normalize_image(face_image)  # BGR 归一化到 [-1, 1]
+        face = normalize_image(face_image)  # 归一化到 [-1, 1]
+
+        if self.debug:
+            print(
+                f"DEBUG: Face input stats - Min: {face.min():.2f}, Max: {face.max():.2f}, Mean: {face.mean():.2f}, Std: {face.std():.2f}"
+            )
+
         face = np.transpose(face, (2, 0, 1))  # HWC -> CHW
-        face = torch.from_numpy(face).unsqueeze(0).to(self.device)  # (1, 3, 112, 112)
+        face_tensor = torch.from_numpy(face).unsqueeze(0).to(self.device)  # (1, 3, 112, 112)
+
+        if self.debug:
+            print(
+                f"DEBUG: Torch tensor stats - Min: {face_tensor.min().item():.2f}, Max: {face_tensor.max().item():.2f}, Mean: {face_tensor.mean().item():.2f}, Std: {face_tensor.std().item():.2f}"
+            )
 
         # 提取特征
         with torch.no_grad():
-            model_output = self.model(face, return_embedding_before_bn=True)
+            model_output = self.model(face_tensor, return_embedding_before_bn=True)
 
             if isinstance(model_output, tuple):
                 embedding, embedding_before_bn = model_output
@@ -176,8 +201,27 @@ class FaceRecognitionPipeline:
                 embedding = model_output
                 embedding_before_bn = model_output
 
-            magnitude = torch.norm(embedding_before_bn, dim=1).item()
-            feature = F.normalize(embedding, dim=1).squeeze(0).cpu().numpy()
+            # NOTE: MagFace 论文中的质量分数取自 BN 之后的特征幅度
+            magnitude = torch.norm(embedding, dim=1).item()
+
+            if self.debug:
+                emb_before = embedding_before_bn.detach().cpu()
+                emb_after = embedding.detach().cpu()
+                print(
+                    f"DEBUG: Embedding_before_bn stats - min: {emb_before.min().item():.4f}, max: {emb_before.max().item():.4f}, mean: {emb_before.mean().item():.4f}, std: {emb_before.std().item():.4f}, L2(before BN): {torch.norm(embedding_before_bn, dim=1).item():.4f}"
+                )
+                print(
+                    f"DEBUG: Embedding (after BN) stats - min: {emb_after.min().item():.4f}, max: {emb_after.max().item():.4f}, mean: {emb_after.mean().item():.4f}, std: {emb_after.std().item():.4f}, L2: {torch.norm(embedding, dim=1).item():.4f}"
+                )
+
+            feature_tensor = F.normalize(embedding, dim=1)
+            feature = feature_tensor.squeeze(0).cpu().numpy()
+
+            if self.debug:
+                print(
+                    f"DEBUG: Final feature stats - min: {feature.min():.4f}, max: {feature.max():.4f}, mean: {feature.mean():.4f}, L2: {np.linalg.norm(feature):.4f}"
+                )
+                print("DEBUG: MagFace Magnitude (after BN): {:.4f}".format(magnitude))
 
         return feature, magnitude
 
@@ -401,6 +445,40 @@ class FaceRecognitionPipeline:
             self.database = pickle.load(f)
         print(f"底库加载成功，共 {len(self.database['names'])} 人")
 
+    def _reset_database(self):
+        self.database = {
+            'names': [],
+            'features': None,
+            'magnitudes': [],
+            'images': []
+        }
+
+    def clear_database(self, path: Optional[str] = None, remove_file: bool = True) -> Dict:
+        """清空内存中的底库，并可选删除持久化文件"""
+        previous_count = len(self.database.get('names', []))
+        self._reset_database()
+
+        removed_file = False
+        if path and remove_file:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+                    removed_file = True
+            except OSError as exc:
+                return {
+                    'success': False,
+                    'message': f"删除文件失败: {exc}",
+                    'removed_file': False,
+                    'previous_count': previous_count
+                }
+
+        return {
+            'success': True,
+            'message': f"已清空底库，共删除 {previous_count} 条记录",
+            'removed_file': removed_file,
+            'previous_count': previous_count
+        }
+
     def list_registered(self) -> List[str]:
         """列出所有已注册人员"""
         return self.database['names'].copy()
@@ -426,6 +504,33 @@ class FaceRecognitionPipeline:
             self.database['images'].pop(idx)
 
         return True
+
+    def _debug(self, message: str):
+        if self.debug:
+            print(message)
+
+    def _debug_model_stats(self):
+        if not self.debug:
+            return
+        try:
+            fc_weight = self.model.state_dict().get('fc.weight')
+            if fc_weight is not None:
+                self._debug(
+                    f"DEBUG: Model fc.weight stats | shape={tuple(fc_weight.shape)} | mean={fc_weight.float().mean():.6f} | std={fc_weight.float().std():.6f}"
+                )
+            bn2_running_mean = getattr(self.model.bn2, 'running_mean', None)
+            bn2_running_var = getattr(self.model.bn2, 'running_var', None)
+            if bn2_running_mean is not None and bn2_running_var is not None:
+                self._debug(
+                    f"DEBUG: Model bn2 running stats | mean_mean={bn2_running_mean.mean().item():.6f} | var_mean={bn2_running_var.mean().item():.6f}"
+                )
+            features_weight = getattr(self.model.features, 'weight', None)
+            if features_weight is not None:
+                self._debug(
+                    f"DEBUG: Model features BN weight stats | mean={features_weight.float().mean():.6f} | std={features_weight.float().std():.6f}"
+                )
+        except Exception as exc:
+            self._debug(f"DEBUG: Failed to dump model stats: {exc}")
 
 
 class BatchFeatureExtractor:
@@ -470,6 +575,8 @@ class BatchFeatureExtractor:
             # 预处理
             batch_tensors = []
             for img in batch:
+                # BGR -> RGB
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 img = normalize_image(img)
                 img = np.transpose(img, (2, 0, 1))
                 batch_tensors.append(img)
@@ -489,26 +596,3 @@ class BatchFeatureExtractor:
         magnitudes = np.concatenate(magnitudes_list, axis=0)
 
         return features, magnitudes
-
-
-if __name__ == '__main__':
-    # 测试代码
-    print("MagFace 推理 Pipeline 测试")
-    print("=" * 50)
-
-    # 创建 Pipeline (无预训练权重，仅测试流程)
-    pipeline = FaceRecognitionPipeline(
-        model_path=None,
-        backbone='iresnet50',  # 使用较小的模型测试
-        device='cpu',
-        detector='mtcnn'
-    )
-
-    print("\nPipeline 初始化成功!")
-    print(f"当前底库人数: {len(pipeline.list_registered())}")
-
-    # 测试质量评估
-    print("\n质量评估测试:")
-    for mag in [15, 25, 40, 60, 80]:
-        quality = pipeline.assess_quality(mag)
-        print(f"  幅度 {mag}: {quality['level']} - {quality['description']}")
